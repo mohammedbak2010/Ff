@@ -80,46 +80,117 @@ local DuelTP = {
 -- ====== ANTI RAGDOLL ======
 local antiRagdollEnabled = false
 local antiRagdollConn = nil
+local arCamConn = nil
+local arCachedChar = {}
+local arIsBoosting = false
+local AR_FORCE_SPEED = 400
+local AR_NORMAL_SPEED = 16
+
+local function arCacheChar()
+    local char = LP.Character
+    if not char then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not hum or not root then return false end
+    arCachedChar = { character = char, humanoid = hum, root = root }
+    return true
+end
+
+local function arIsRagdolled()
+    local hum = arCachedChar.humanoid
+    if not hum then return false end
+    local state = hum:GetState()
+    if state == Enum.HumanoidStateType.Physics or
+       state == Enum.HumanoidStateType.Ragdoll or
+       state == Enum.HumanoidStateType.FallingDown then return true end
+    local endTime = LP:GetAttribute("RagdollEndTime")
+    if endTime then
+        local now = workspace:GetServerTimeNow()
+        if (endTime - now) > 0 then return true end
+    end
+    return false
+end
+
+local function arRemoveConstraints()
+    local char = arCachedChar.character
+    if not char then return end
+    for _, d in ipairs(char:GetDescendants()) do
+        if d:IsA("BallSocketConstraint") or d:IsA("HingeConstraint") or
+           (d:IsA("Attachment") and d.Name:find("RagdollAttachment")) then
+            pcall(function() d:Destroy() end)
+        end
+        if d:IsA("Motor6D") and not d.Enabled then d.Enabled = true end
+    end
+end
+
+local function arForceExit()
+    local hum = arCachedChar.humanoid
+    local root = arCachedChar.root
+    if not hum or not root then return end
+    pcall(function()
+        local now = workspace:GetServerTimeNow()
+        LP:SetAttribute("RagdollEndTime", now)
+    end)
+    if not arIsBoosting then
+        arIsBoosting = true
+        hum.WalkSpeed = AR_FORCE_SPEED
+    end
+    if hum.Health > 0 then hum:ChangeState(Enum.HumanoidStateType.Running) end
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+    root.Anchored = false
+    local cam = workspace.CurrentCamera
+    if cam then cam.CameraSubject = hum end
+end
+
+local function arResetSpeed()
+    if arIsBoosting and arCachedChar.humanoid then
+        arCachedChar.humanoid.WalkSpeed = AR_NORMAL_SPEED
+        arIsBoosting = false
+    end
+end
 
 local function StartAntiRagdoll()
     if antiRagdollEnabled then return end
     antiRagdollEnabled = true
+    arCacheChar()
     antiRagdollConn = RunService.Heartbeat:Connect(function()
         if not antiRagdollEnabled then return end
-        local char = LP.Character
-        if not char then return end
-        local hum = char:FindFirstChildOfClass("Humanoid")
-        local root = char:FindFirstChild("HumanoidRootPart")
-        if not hum then return end
-
-        local state = hum:GetState()
-        if state == Enum.HumanoidStateType.Ragdoll or 
-           state == Enum.HumanoidStateType.FallingDown or 
-           state == Enum.HumanoidStateType.Physics then
-
-            hum:ChangeState(Enum.HumanoidStateType.Running)
-            if root then
-                root.AssemblyLinearVelocity = Vector3.new(root.AssemblyLinearVelocity.X, 0, root.AssemblyLinearVelocity.Z)
-                root.AssemblyAngularVelocity = Vector3.zero
-            end
-            workspace.CurrentCamera.CameraSubject = hum
+        if not arCachedChar.humanoid then arCacheChar(); return end
+        if arIsRagdolled() then
+            arRemoveConstraints()
+            arForceExit()
+        elseif arIsBoosting then
+            arResetSpeed()
         end
-
-        if hum.PlatformStand then hum.PlatformStand = false end
-        hum.AutoRotate = true
-
-        for _, obj in ipairs(char:GetDescendants()) do
-            if obj:IsA("Motor6D") and not obj.Enabled then
-                obj.Enabled = true
-            end
-        end
+        local hum = arCachedChar.humanoid
+        if hum and hum.PlatformStand then hum.PlatformStand = false end
+    end)
+    if arCamConn then arCamConn:Disconnect() end
+    arCamConn = RunService.RenderStepped:Connect(function()
+        if not antiRagdollEnabled then arCamConn:Disconnect(); arCamConn = nil; return end
+        local cam = workspace.CurrentCamera
+        local hum = arCachedChar.humanoid
+        if cam and hum and cam.CameraSubject ~= hum then cam.CameraSubject = hum end
     end)
 end
 
 local function StopAntiRagdoll()
     antiRagdollEnabled = false
+    arResetSpeed()
+    arCachedChar = {}
     if antiRagdollConn then antiRagdollConn:Disconnect(); antiRagdollConn = nil end
+    if arCamConn then arCamConn:Disconnect(); arCamConn = nil end
 end
+
+LP.CharacterAdded:Connect(function()
+    task.wait(0.5)
+    if antiRagdollEnabled then
+        StopAntiRagdoll()
+        task.wait(0.1)
+        StartAntiRagdoll()
+    end
+end)
 
 -- ====== WAYPOINTS ======
 local WP_PARTS = {}
@@ -585,58 +656,71 @@ end
 
 -- ====== AUTO TRACK ======
 local trackConn = nil
-local trackBodyGyro = nil
+local trackAlignOri = nil
+local trackAttachment = nil
 
 local function GetClosestPlayer()
-    if not HRP then return nil, nil end
-    local closest, best, closestHead = nil, 9999, nil
+    if not HRP then return nil end
+    local closest, best = nil, 9999
     for _, p in ipairs(Players:GetPlayers()) do
         if p ~= LP and p.Character then
             local root = p.Character:FindFirstChild("HumanoidRootPart")
-            local head = p.Character:FindFirstChild("Head")
             local hum = p.Character:FindFirstChildOfClass("Humanoid")
-            if root and head and hum and hum.Health > 0 then
+            if root and hum and hum.Health > 0 then
                 local d = (HRP.Position - root.Position).Magnitude
-                if d < best then best = d; closest = root; closestHead = head end
+                if d < best then best = d; closest = root end
             end
         end
     end
-    return closest, closestHead
+    return closest
+end
+
+local function setupTrackAlign()
+    if not HRP then return false end
+    if trackAlignOri then pcall(function() trackAlignOri:Destroy() end); trackAlignOri = nil end
+    if trackAttachment then pcall(function() trackAttachment:Destroy() end); trackAttachment = nil end
+    trackAttachment = Instance.new("Attachment")
+    trackAttachment.Name = "H2N_Track_Att"
+    trackAttachment.Parent = HRP
+    trackAlignOri = Instance.new("AlignOrientation")
+    trackAlignOri.Name = "H2N_Track_Align"
+    trackAlignOri.Attachment0 = trackAttachment
+    trackAlignOri.Mode = Enum.OrientationAlignmentMode.OneAttachment
+    trackAlignOri.RigidityEnabled = true
+    trackAlignOri.MaxTorque = 1000000
+    trackAlignOri.Responsiveness = 200
+    trackAlignOri.Enabled = false
+    trackAlignOri.Parent = HRP
+    return true
 end
 
 local function StartAutoTrack()
     State.AutoTrack = true
+    setupTrackAlign()
     if trackConn then trackConn:Disconnect() end
-    if HRP then
-        if trackBodyGyro then trackBodyGyro:Destroy() end
-        trackBodyGyro = Instance.new("BodyGyro")
-        trackBodyGyro.MaxTorque = Vector3.new(0, 400000, 0)
-        trackBodyGyro.P = 5000
-        trackBodyGyro.D = 500
-        trackBodyGyro.Parent = HRP
-    end
     trackConn = RunService.Heartbeat:Connect(function()
         if not State.AutoTrack or not HRP then
-            if trackBodyGyro then trackBodyGyro.Enabled = false end
+            if trackAlignOri then trackAlignOri.Enabled = false end
             return
         end
-        local target, targetHead = GetClosestPlayer()
-        if target and targetHead then
-            local dir = target.Position - HRP.Position
-            local flatDir = Vector3.new(dir.X, 0, dir.Z)
-            if flatDir.Magnitude > 1 then
-                HRP.AssemblyLinearVelocity = flatDir.Unit * TRACK_SPEED
+        local target = GetClosestPlayer()
+        if target then
+            local dir = Vector3.new(target.Position.X - HRP.Position.X, 0, target.Position.Z - HRP.Position.Z)
+            if dir.Magnitude > 1 then
+                HRP.AssemblyLinearVelocity = dir.Unit * TRACK_SPEED
             else
                 HRP.AssemblyLinearVelocity = Vector3.new(0, HRP.AssemblyLinearVelocity.Y, 0)
             end
-            if trackBodyGyro then
-                trackBodyGyro.Enabled = true
-                local lookAtCF = CFrame.lookAt(HRP.Position, targetHead.Position)
-                trackBodyGyro.CFrame = lookAtCF
+            if trackAlignOri then
+                trackAlignOri.Enabled = true
+                local lookPos = Vector3.new(target.Position.X, HRP.Position.Y, target.Position.Z)
+                trackAlignOri.CFrame = CFrame.lookAt(HRP.Position, lookPos)
             end
+            if Hum then Hum.AutoRotate = false end
         else
             HRP.AssemblyLinearVelocity = Vector3.new(0, HRP.AssemblyLinearVelocity.Y, 0)
-            if trackBodyGyro then trackBodyGyro.Enabled = false end
+            if trackAlignOri then trackAlignOri.Enabled = false end
+            if Hum then Hum.AutoRotate = true end
         end
     end)
     Notify("Auto Track ON")
@@ -645,8 +729,10 @@ end
 local function StopAutoTrack()
     State.AutoTrack = false
     if trackConn then trackConn:Disconnect(); trackConn = nil end
-    if trackBodyGyro then trackBodyGyro:Destroy(); trackBodyGyro = nil end
+    if trackAlignOri then trackAlignOri.Enabled = false; trackAlignOri:Destroy(); trackAlignOri = nil end
+    if trackAttachment then trackAttachment:Destroy(); trackAttachment = nil end
     if HRP then HRP.AssemblyLinearVelocity = Vector3.new(0, HRP.AssemblyLinearVelocity.Y, 0) end
+    if Hum then Hum.AutoRotate = true end
     Notify("Auto Track OFF")
 end
 
