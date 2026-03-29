@@ -573,53 +573,69 @@ local function setPhaseFromPoint(side, startPoint)
     end
 end
 
+local duelTPInProgress = false
+
 local function teleportSequence(side)
     local now = tick()
-    if now - DuelTP.LastTPTime < DuelTP.Cooldown then return false, nil end
+    if now - DuelTP.LastTPTime < DuelTP.Cooldown then return false end
     local points = DuelTP.TPSequence[side]
-    if not points or not points[1] or not points[2] then return false, nil end
+    if not points or not points[1] or not points[2] then return false end
     local char = LP.Character
-    if not char then return false, nil end
+    if not char then return false end
     local hrp = char:FindFirstChild("HumanoidRootPart")
-    if not hrp then return false, nil end
-    hrp.CFrame = CFrame.new(points[1])
-    task.wait(0.1)
-    hrp.CFrame = CFrame.new(points[2])
+    if not hrp then return false end
+
     DuelTP.LastTPTime = tick()
-    return true, points[2]
+
+    -- التيليبورت بتأخير: L1 انتظر 0.2 ثم L2 انتظر 0.15 ثم يشغل الأوتو دولز
+    task.spawn(function()
+        -- خطوة 1: انتقل للنقطة الأولى
+        hrp.CFrame = CFrame.new(points[1])
+        Notify("⚡ TP → " .. (side == "LEFT" and "L1" or "R1"))
+        task.wait(0.2)
+
+        -- خطوة 2: انتقل للنقطة الثانية
+        local hrp2 = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+        if hrp2 then hrp2.CFrame = CFrame.new(points[2]) end
+        Notify("⚡ TP → " .. (side == "LEFT" and "L2" or "R2"))
+        task.wait(0.15)
+
+        -- خطوة 3: شغل الأوتو دولز بدون تأخير
+        if not State.DuelTP then return end
+        if side == "LEFT" then
+            if State.AutoPlayLeft then StopAutoPlayLeft() end
+            if State.AutoPlayRight then StopAutoPlayRight() end
+            State.AutoPlayLeft = true
+            aplPhase = 1
+            if Hum then Hum.AutoRotate = false end
+            if aplConn then aplConn:Disconnect() end
+            aplConn = RunService.Heartbeat:Connect(updateAutoPlayLeft)
+            Notify("▶ Auto Play Left: L2 → L1 → R1 → R2")
+        else
+            if State.AutoPlayLeft then StopAutoPlayLeft() end
+            if State.AutoPlayRight then StopAutoPlayRight() end
+            State.AutoPlayRight = true
+            aprPhase = 1
+            if Hum then Hum.AutoRotate = false end
+            if aprConn then aprConn:Disconnect() end
+            aprConn = RunService.Heartbeat:Connect(updateAutoPlayRight)
+            Notify("▶ Auto Play Right: R2 → R1 → L1 → L2")
+        end
+
+        duelTPInProgress = false
+    end)
+
+    return true
 end
 
 local function onRagdollHit()
     if not State.DuelTP then return false end
     if not DuelTP.EnemySide then return false end
-    local side = DuelTP.EnemySide
-    local success, finalPoint = teleportSequence(side)
-    if success and finalPoint then
-        local pointName = (side == "LEFT") and "L2" or "R2"
-        if side == "LEFT" then
-            if State.AutoPlayLeft then StopAutoPlayLeft() end
-            if State.AutoPlayRight then StopAutoPlayRight() end
-            State.AutoPlayLeft = true
-            setPhaseFromPoint("LEFT", pointName)
-            aplPhase = 1
-            if Hum then Hum.AutoRotate = false end
-            if aplConn then aplConn:Disconnect() end
-            aplConn = RunService.Heartbeat:Connect(updateAutoPlayLeft)
-            Notify("⚡ TP → " .. pointName)
-        else
-            if State.AutoPlayLeft then StopAutoPlayLeft() end
-            if State.AutoPlayRight then StopAutoPlayRight() end
-            State.AutoPlayRight = true
-            setPhaseFromPoint("RIGHT", pointName)
-            aprPhase = 1
-            if Hum then Hum.AutoRotate = false end
-            if aprConn then aprConn:Disconnect() end
-            aprConn = RunService.Heartbeat:Connect(updateAutoPlayRight)
-            Notify("⚡ TP → " .. pointName)
-        end
-        return true
-    end
-    return false
+    if duelTPInProgress then return false end
+    duelTPInProgress = true
+    local success = teleportSequence(DuelTP.EnemySide)
+    if not success then duelTPInProgress = false end
+    return success
 end
 
 local duelTPConn = nil
